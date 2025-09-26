@@ -35,10 +35,10 @@
         <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.1" />
     </ItemGroup>
 
-    <!-- Include project-root README and LICENSE in the NuGet package -->
+    <!-- Include solution-root README and LICENSE in the NuGet package -->
     <ItemGroup>
-        <None Include="README.md" Pack="true" PackagePath="" />
-        <None Include="LICENSE" Pack="true" PackagePath="" />
+        <None Include="..\..\..\README.md" Pack="true" PackagePath="" />
+        <None Include="..\..\..\LICENSE" Pack="true" PackagePath="" />
     </ItemGroup>
 
 </Project>
