@@ -9,7 +9,7 @@ namespace Azunt.TenantSettingManagement
     {
         private readonly ILogger<TenantSettingsSchemaManager> _logger;
 
-        // 재사용용 상수: SQL Server 2012/2014에서도 동작하는 UTC now 표현
+        // SQL Server 2012/2014 호환 UTC now
         private const string UtcNowSql = "TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00')";
 
         public TenantSettingsSchemaManager(ILogger<TenantSettingsSchemaManager> logger)
@@ -58,10 +58,8 @@ IF NOT EXISTS (
     WHERE name = 'IX_TenantSettings_SettingKey' 
       AND object_id = OBJECT_ID('dbo.TenantSettings')
 )
-BEGIN
     CREATE NONCLUSTERED INDEX IX_TenantSettings_SettingKey 
-        ON dbo.TenantSettings(SettingKey, TenantID);
-END;", connection);
+        ON dbo.TenantSettings(SettingKey, TenantID);", connection);
 
             cmdIndex.ExecuteNonQuery();
         }
@@ -100,18 +98,20 @@ WHERE c.object_id = OBJECT_ID('dbo.TenantSettings')
                 return; // 이미 목표 타입
             }
 
-            if (!string.Equals(currentType, "datetime2", StringComparison.OrdinalIgnoreCase))
+            // 업그레이드 대상: datetime2 또는 datetime
+            if (!(string.Equals(currentType, "datetime2", StringComparison.OrdinalIgnoreCase) ||
+                  string.Equals(currentType, "datetime", StringComparison.OrdinalIgnoreCase)))
             {
                 _logger.LogWarning("TenantSettings.UpdatedAt unexpected type: {Type}. Skipping upgrade.", currentType);
                 return;
             }
 
-            // 2) 업그레이드 배치: DEFAULT 제약 제거 → tmp 컬럼 생성 → 데이터 백필 → NOT NULL → 원 컬럼 교체 → DEFAULT 재설정
+            // 2) 업그레이드 배치 (메타데이터 가시성 이슈 회피: 동적 SQL 사용)
             var sql = $@"
 BEGIN TRY
     BEGIN TRAN;
 
-    -- 1) 기존 DEFAULT 제약 제거
+    -- A) 기존 DEFAULT 제약 제거 (있으면)
     DECLARE @dfName sysname;
     SELECT @dfName = d.name
     FROM sys.default_constraints d
@@ -128,29 +128,33 @@ BEGIN TRY
         EXEC (@sqlDrop);
     END
 
-    -- 2) 임시 컬럼 추가 (datetimeoffset(7))
-    ALTER TABLE dbo.TenantSettings
-      ADD UpdatedAt_tmp DATETIMEOFFSET(7) NULL;
+    -- B) 임시 컬럼 추가 (없을 때만)
+    IF COL_LENGTH('dbo.TenantSettings', 'UpdatedAt_tmp') IS NULL
+        ALTER TABLE dbo.TenantSettings ADD UpdatedAt_tmp DATETIMEOFFSET(7) NULL;
 
-    -- 3) 기존 값 UTC 오프셋으로 백필
-    UPDATE dbo.TenantSettings
-       SET UpdatedAt_tmp = CASE 
-                               WHEN UpdatedAt IS NULL THEN NULL
-                               ELSE TODATETIMEOFFSET(UpdatedAt, '+00:00')
-                           END;
+    -- C) 데이터 백필 (동적 SQL로 분리)
+    DECLARE @sqlUpdate nvarchar(max) = N'
+        UPDATE dbo.TenantSettings
+           SET UpdatedAt_tmp = CASE 
+                                   WHEN UpdatedAt IS NULL THEN NULL
+                                   ELSE TODATETIMEOFFSET(UpdatedAt, ''+00:00'')
+                               END;';
+    EXEC sp_executesql @sqlUpdate;
 
-    -- 4) NOT NULL 적용
-    ALTER TABLE dbo.TenantSettings
-      ALTER COLUMN UpdatedAt_tmp DATETIMEOFFSET(7) NOT NULL;
+    -- D) NOT NULL 적용 (동적 SQL로 분리)
+    DECLARE @sqlAlter nvarchar(max) = N'
+        ALTER TABLE dbo.TenantSettings
+          ALTER COLUMN UpdatedAt_tmp DATETIMEOFFSET(7) NOT NULL;';
+    EXEC sp_executesql @sqlAlter;
 
-    -- 5) 원 컬럼 삭제
-    ALTER TABLE dbo.TenantSettings 
-      DROP COLUMN UpdatedAt;
+    -- E) 원 컬럼 삭제 (있을 때만)
+    IF COL_LENGTH('dbo.TenantSettings', 'UpdatedAt') IS NOT NULL
+        ALTER TABLE dbo.TenantSettings DROP COLUMN UpdatedAt;
 
-    -- 6) 임시 컬럼 이름 변경
+    -- F) 임시 컬럼 이름 변경 (sp_rename은 별도 컴파일 경로)
     EXEC sp_rename 'dbo.TenantSettings.UpdatedAt_tmp', 'UpdatedAt', 'COLUMN';
 
-    -- 7) 새 DEFAULT 제약 (SQL2012/2014 호환식 UTC now)
+    -- G) 새 DEFAULT 제약 (SQL2012/2014 호환식 UTC now)
     ALTER TABLE dbo.TenantSettings
       ADD CONSTRAINT DF_TenantSettings_UpdatedAt
         DEFAULT ({UtcNowSql}) FOR UpdatedAt;
@@ -180,10 +184,8 @@ IF NOT EXISTS (
     SELECT 1 FROM dbo.TenantSettings 
     WHERE TenantID = @TenantID AND SettingKey = @SettingKey
 )
-BEGIN
     INSERT INTO dbo.TenantSettings (TenantID, SettingKey, Value, UpdatedAt, UpdatedBy)
-    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);
-END;", connection);
+    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);", connection);
 
             cmd.Parameters.AddWithValue("@TenantID", tenantId);
             cmd.Parameters.AddWithValue("@SettingKey", settingKey);
@@ -208,10 +210,8 @@ IF NOT EXISTS (
     SELECT 1 FROM dbo.TenantSettings 
     WHERE TenantID = @TenantID AND SettingKey = @SettingKey
 )
-BEGIN
     INSERT INTO dbo.TenantSettings (TenantID, SettingKey, Value, UpdatedAt, UpdatedBy)
-    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);
-END;", connection);
+    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);", connection);
 
                 cmd.Parameters.AddWithValue("@TenantID", tenantId);
                 cmd.Parameters.AddWithValue("@SettingKey", settingKey);
@@ -220,9 +220,7 @@ END;", connection);
 
                 var rows = cmd.ExecuteNonQuery();
                 if (rows > 0)
-                {
                     _logger.LogInformation("Seeded {SettingKey}={Value} for TenantID={TenantID}", settingKey, defaultValue, tenantId);
-                }
             }
         }
 
@@ -238,12 +236,8 @@ END;", connection);
             var tenantIds = new List<long>();
             using (var cmd = new SqlCommand("SELECT ID FROM dbo.Tenants;", connection))
             using (var reader = cmd.ExecuteReader())
-            {
                 while (reader.Read())
-                {
                     tenantIds.Add(reader.GetInt64(0));
-                }
-            }
 
             // 2) 각 테넌트에 대해 Seed 실행
             foreach (var tenantId in tenantIds)
@@ -253,10 +247,8 @@ IF NOT EXISTS (
     SELECT 1 FROM dbo.TenantSettings 
     WHERE TenantID = @TenantID AND SettingKey = @SettingKey
 )
-BEGIN
     INSERT INTO dbo.TenantSettings (TenantID, SettingKey, Value, UpdatedAt, UpdatedBy)
-    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);
-END;", connection);
+    VALUES (@TenantID, @SettingKey, @Value, {UtcNowSql}, @UpdatedBy);", connection);
 
                 cmd.Parameters.AddWithValue("@TenantID", tenantId);
                 cmd.Parameters.AddWithValue("@SettingKey", settingKey);
@@ -265,9 +257,7 @@ END;", connection);
 
                 var rows = cmd.ExecuteNonQuery();
                 if (rows > 0)
-                {
                     _logger.LogInformation("Seeded {SettingKey}={Value} for TenantID={TenantID}", settingKey, defaultValue, tenantId);
-                }
             }
         }
     }
