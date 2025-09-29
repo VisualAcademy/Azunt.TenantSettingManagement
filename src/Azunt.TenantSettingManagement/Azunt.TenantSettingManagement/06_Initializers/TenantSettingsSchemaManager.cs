@@ -95,4 +95,44 @@ IF NOT EXISTS (SELECT 1 FROM dbo.TenantSettings WHERE TenantID = @TenantID AND S
             cmd.ExecuteNonQuery();
         }
     }
+
+    /// <summary>
+    /// Reads all Tenant IDs from dbo.Tenants and seeds the setting if missing for each tenant.
+    /// </summary>
+    public void SeedFromTenantsTable(string connectionString, string settingKey, string defaultValue, string? updatedBy = "System")
+    {
+        using var connection = new SqlConnection(connectionString);
+        connection.Open();
+
+        // 1) Tenants.ID 목록 가져오기
+        var tenantIds = new List<long>();
+        using (var cmd = new SqlCommand("SELECT ID FROM dbo.Tenants", connection))
+        using (var reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                tenantIds.Add(reader.GetInt64(0));
+            }
+        }
+
+        // 2) 각 테넌트에 대해 Seed 실행
+        foreach (var tenantId in tenantIds)
+        {
+            using var cmd = new SqlCommand(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.TenantSettings WHERE TenantID = @TenantID AND SettingKey = @SettingKey)
+    INSERT INTO dbo.TenantSettings (TenantID, SettingKey, Value, UpdatedAt, UpdatedBy)
+    VALUES (@TenantID, @SettingKey, @Value, SYSUTCDATETIME(), @UpdatedBy);", connection);
+
+            cmd.Parameters.AddWithValue("@TenantID", tenantId);
+            cmd.Parameters.AddWithValue("@SettingKey", settingKey);
+            cmd.Parameters.AddWithValue("@Value", (object?)defaultValue ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@UpdatedBy", (object?)updatedBy ?? DBNull.Value);
+
+            var rows = cmd.ExecuteNonQuery();
+            if (rows > 0)
+            {
+                _logger.LogInformation("Seeded {SettingKey}={Value} for TenantID={TenantID}", settingKey, defaultValue, tenantId);
+            }
+        }
+    }
 }
